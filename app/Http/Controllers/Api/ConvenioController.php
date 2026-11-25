@@ -3,9 +3,9 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use Illuminate\Http\Request;
 use App\Models\Api\Convenio;
 use App\Models\Api\Representante;
+use Illuminate\Http\Request;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -49,7 +49,7 @@ class ConvenioController extends Controller
             'convenio_padre_id' => 'nullable|exists:convenios,id',
             'tipo_instrumento_id' => 'required|exists:tipo_instrumentos,id',
             'unidad_id' => 'required|exists:unidad_responsables,id',
-            'unidad_responsable_secundaria_id' => 'required|integer|exists:unidad_responsables,id|different:unidad_id',
+            'unidad_responsable_secundaria_id' => 'required|integer|exists:unidad_responsables,id',
             'representantes' => 'sometimes|array',
             'representantes.*.nombre' => 'nullable|string|max:45',
             'representantes.*.apellido' => 'nullable|string|max:45',
@@ -141,17 +141,38 @@ class ConvenioController extends Controller
     /**
      * Update the specified resource in storage.
      */
-
     public function update(Request $request, Convenio $convenio)
     {
         $datos = $request->validate([
             'fecha_creacion' => 'sometimes|date',
-            'titulo' => 'sometimes|string|max:45',
-            'codigo' => 'sometimes|string|max:45|unique:convenios,codigo,' . $convenio->id,
+            'titulo' => 'sometimes|string|max:255',
+            'codigo' => 'sometimes|string|max:45|unique:convenios,codigo,'.$convenio->id,
             'firma_decano' => 'sometimes|boolean',
             'fecha_vencimiento' => 'nullable|date',
             'convenio_padre_id' => 'nullable|exists:convenios,id',
             'tipo_instrumento_id' => 'sometimes|exists:tipo_instrumentos,id',
+            'unidad_responsable_id' => 'sometimes|exists:unidad_responsables,id',
+            'unidad_responsable_secundaria_id' => [
+                'sometimes',
+                'exists:unidad_responsables,id',
+                'different:unidad_responsable_id',
+            ],
+            'representantes' => 'sometimes|array',
+            'representantes.*.nombre' => 'nullable|string|max:45',
+            'representantes.*.apellido' => 'nullable|string|max:45',
+            'representantes.*.cargo' => 'nullable|string|max:45',
+            'representantes.*.email' => 'nullable|email|max:45',
+            'representantes.*.dni' => 'nullable|string|max:45',
+            'representantes.*.cuil' => 'nullable|string|max:45',
+            'detalle_pasantia' => 'nullable|array',
+            'detalle_pasantia.fecha_inicio_pasantia' => 'nullable|date',
+            'detalle_pasantia.fecha_fin_pasantia' => [
+                'nullable',
+                'date',
+                'after_or_equal:detalle_pasantia.fecha_inicio_pasantia',
+            ],
+            'detalle_pasantia.carga_horaria_semanal' => 'nullable|numeric|min:0',
+            'detalle_pasantia.asignacion_estimulo' => 'nullable|string|max:45',
             'revisor_id' => [
                 'required_if:estado,revision',
                 'nullable',
@@ -195,6 +216,27 @@ class ConvenioController extends Controller
                     ]);
                 }
 
+                if ($anterior === 'borrador' && $datos['estado'] === 'revision') {
+                    $devolucion = $convenio->historialEstados()
+                        ->where('estado_anterior', 'revision')
+                        ->where('estado_nuevo', 'borrador')
+                        ->latest('fecha_cambio')
+                        ->first();
+
+                    if (
+                        $devolucion
+                        && (int) $datos['revisor_id'] !== (int) $devolucion->user_id
+                    ) {
+                        throw ValidationException::withMessages([
+                            'revisor_id' => ['La corrección debe enviarse al mismo revisor que devolvió el borrador.'],
+                        ]);
+                    }
+
+                    if ($devolucion && $rol !== 'gestion') {
+                        abort(403, 'Solo Gestión puede confirmar la corrección de un borrador devuelto.');
+                    }
+                }
+
                 if (empty($datos['fundamento'])) {
                     throw ValidationException::withMessages([
                         'fundamento' => ['El fundamento es obligatorio al cambiar el estado.'],
@@ -222,19 +264,60 @@ class ConvenioController extends Controller
                 }
             }
 
-            $convenio->revisorAsignado  = $datos['revisor_id'] ?? null;
+            $convenio->revisorAsignado = $datos['revisor_id'] ?? null;
             $convenio->fundamentoCambio = $datos['fundamento'] ?? null;
 
-            $convenio->update(Arr::except($datos, ['fundamento', 'documento_id']));
+            $convenio->update(Arr::except($datos, [
+                'fundamento',
+                'documento_id',
+                'representantes',
+                'detalle_pasantia',
+            ]));
+
+            if (array_key_exists('representantes', $datos)) {
+                $convenio->representantes()->detach();
+
+                foreach ($datos['representantes'] as $representante) {
+                    if (! collect($representante)->contains(fn ($valor) => filled($valor))) {
+                        continue;
+                    }
+
+                    $nuevoRepresentante = Representante::create([
+                        'nombre' => $representante['nombre'] ?? null,
+                        'apellido' => $representante['apellido'] ?? null,
+                        'cargo' => $representante['cargo'] ?? null,
+                        'email' => $representante['email'] ?? null,
+                        'dni' => $representante['dni'] ?? null,
+                        'cuil' => $representante['cuil'] ?? null,
+                        'unidad_responsable_id' => $convenio->unidad_responsable_id,
+                    ]);
+                    $convenio->representantes()->attach($nuevoRepresentante);
+                }
+            }
+
+            if (array_key_exists('detalle_pasantia', $datos)) {
+                $detalle = $datos['detalle_pasantia'];
+
+                if (is_array($detalle) && collect($detalle)->contains(fn ($valor) => filled($valor))) {
+                    $convenio->detallePasantia()->updateOrCreate([], [
+                        'fecha_inicio' => $detalle['fecha_inicio_pasantia'] ?? null,
+                        'fecha_fin' => $detalle['fecha_fin_pasantia'] ?? null,
+                        'carga_horaria_semanal' => $detalle['carga_horaria_semanal'] ?? null,
+                        'asignacion_estimulo' => $detalle['asignacion_estimulo'] ?? null,
+                    ]);
+                } else {
+                    $convenio->detallePasantia()->delete();
+                }
+            }
 
             if ($cambiaEstado) {
                 $convenio->historialEstados()->create([
-                    'user_id'         => $request->user()->id,
-                    'documento_id'    => $datos['documento_id'] ?? null,
-                    'fundamento'      => $datos['fundamento'],
-                    'fecha_cambio'    => now(),
+                    'user_id' => $request->user()->id,
+                    'documento_id' => $datos['documento_id'] ?? null,
+                    'fundamento' => $datos['fundamento'],
+                    'fecha_cambio' => now(),
                     'estado_anterior' => $anterior,
-                    'estado_nuevo'    => $datos['estado'],
+                    'estado_nuevo' => $datos['estado'],
                 ]);
             }
 

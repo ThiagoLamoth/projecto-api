@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Models\Api\Convenio;
+use App\Models\Api\Representante;
 use App\Models\Api\TipoInstrumento;
 use App\Models\Api\UnidadResponsable;
 use App\Models\Api\User;
@@ -167,7 +168,7 @@ class ConvenioDraftWorkflowTest extends TestCase
             ->assertJsonValidationErrors(['estado']);
     }
 
-    public function test_it_rejects_the_same_unit_as_primary_and_secondary(): void
+    public function test_it_allows_a_draft_to_use_the_same_primary_and_secondary_unit(): void
     {
         Sanctum::actingAs(User::create([
             'name' => 'Gestor',
@@ -191,8 +192,17 @@ class ConvenioDraftWorkflowTest extends TestCase
             'tipo_instrumento_id' => $tipo->id,
             'unidad_id' => $unidad->id,
             'unidad_responsable_secundaria_id' => $unidad->id,
-        ])->assertUnprocessable()
-            ->assertJsonValidationErrors(['unidad_responsable_secundaria_id']);
+        ])->assertCreated()
+            ->assertJsonPath('estado', 'borrador')
+            ->assertJsonPath('unidad.id', $unidad->id)
+            ->assertJsonPath('unidad_responsable_secundaria.id', $unidad->id);
+
+        $this->assertDatabaseHas('convenios', [
+            'titulo' => 'Convenio con una sola unidad',
+            'unidad_responsable_id' => $unidad->id,
+            'unidad_responsable_secundaria_id' => $unidad->id,
+            'estado' => 'borrador',
+        ]);
     }
 
     public function test_it_creates_a_draft_with_form_data_and_generated_metadata(): void
@@ -359,5 +369,170 @@ class ConvenioDraftWorkflowTest extends TestCase
             ->assertJsonPath('data.0.id', $convenio->id)
             ->assertJsonPath('data.0.historial_estados.0.estado_anterior', 'revision')
             ->assertJsonPath('data.0.historial_estados.0.estado_nuevo', 'borrador');
+    }
+
+    public function test_gestor_can_correct_a_returned_draft_and_resend_it_to_the_same_reviewer(): void
+    {
+        $gestor = User::create([
+            'name' => 'Gestor',
+            'email' => 'gestor@example.test',
+            'password' => 'password',
+            'rol' => 'gestion',
+        ]);
+        $revisor = User::create([
+            'name' => 'Revisor',
+            'email' => 'revisor@example.test',
+            'password' => 'password',
+            'rol' => 'revision',
+        ]);
+        $unidad = UnidadResponsable::create(['nombre' => 'Ingeniería', 'tipo' => 'Facultad']);
+        $unidadSecundaria = UnidadResponsable::create(['nombre' => 'Rectorado', 'tipo' => 'Administrativa']);
+        $tipo = TipoInstrumento::create(['nombre' => 'Pasantía', 'categoria' => 'Pasantía']);
+        $convenio = Convenio::create([
+            'fecha_creacion' => now()->toDateString(),
+            'titulo' => 'Convenio devuelto',
+            'estado' => 'borrador',
+            'codigo' => 'CONV-CORREGIR-001',
+            'tipo_instrumento_id' => $tipo->id,
+            'unidad_responsable_id' => $unidad->id,
+            'unidad_responsable_secundaria_id' => $unidadSecundaria->id,
+        ]);
+        $convenio->historialEstados()->create([
+            'user_id' => $revisor->id,
+            'fundamento' => 'Completar los datos',
+            'fecha_cambio' => now(),
+            'estado_anterior' => 'revision',
+            'estado_nuevo' => 'borrador',
+        ]);
+        $representanteAnterior = Representante::create([
+            'nombre' => 'Ana',
+            'email' => 'ana@example.test',
+            'cuil' => '20-12345678-9',
+            'telefono' => '123',
+            'unidad_responsable_id' => $unidad->id,
+        ]);
+        $convenio->representantes()->attach($representanteAnterior);
+        $convenio->detallePasantia()->create([
+            'fecha_inicio' => '2027-01-01',
+            'fecha_fin' => '2027-02-01',
+            'carga_horaria_semanal' => '10',
+            'asignacion_estimulo' => '1000',
+        ]);
+
+        Sanctum::actingAs($gestor);
+        $this->putJson("/api/convenios/{$convenio->id}", [
+            'titulo' => 'Convenio corregido',
+            'unidad_responsable_id' => $unidad->id,
+            'unidad_responsable_secundaria_id' => $unidadSecundaria->id,
+            'representantes' => [[
+                'nombre' => 'Lucía',
+                'apellido' => 'Pérez',
+                'cargo' => 'Directora',
+                'email' => 'lucia@example.test',
+                'dni' => '12345678',
+                'cuil' => '27-12345678-9',
+            ]],
+            'detalle_pasantia' => [
+                'fecha_inicio_pasantia' => '2027-03-01',
+                'fecha_fin_pasantia' => '2027-06-01',
+                'carga_horaria_semanal' => '20',
+                'asignacion_estimulo' => '2000',
+            ],
+            'estado' => 'revision',
+            'revisor_id' => $revisor->id,
+            'fundamento' => 'Se corrigieron los datos',
+        ])->assertOk()
+            ->assertJsonPath('estado', 'revision')
+            ->assertJsonPath('titulo', 'Convenio corregido')
+            ->assertJsonPath('revisor.id', $revisor->id);
+
+        $this->assertDatabaseHas('detalle_pasantias', [
+            'convenio_id' => $convenio->id,
+            'carga_horaria_semanal' => '20',
+        ]);
+        $detalleActualizado = $convenio->fresh()->detallePasantia;
+        $this->assertSame('2027-03-01', $detalleActualizado->fecha_inicio->format('Y-m-d'));
+        $this->assertSame('2027-06-01', $detalleActualizado->fecha_fin->format('Y-m-d'));
+        $this->assertDatabaseHas('representantes', [
+            'nombre' => 'Lucía',
+            'apellido' => 'Pérez',
+        ]);
+        $this->assertDatabaseMissing('partes', [
+            'convenio_id' => $convenio->id,
+            'representante_id' => $representanteAnterior->id,
+        ]);
+        $this->assertDatabaseHas('historial_estados', [
+            'convenio_id' => $convenio->id,
+            'estado_anterior' => 'borrador',
+            'estado_nuevo' => 'revision',
+            'fundamento' => 'Se corrigieron los datos',
+        ]);
+        $this->assertDatabaseHas('notificaciones', [
+            'user_id' => $revisor->id,
+            'convenio_id' => $convenio->id,
+            'mensaje' => 'Se te asignó el convenio CONV-CORREGIR-001: Convenio corregido. Fundamento: Se corrigieron los datos',
+        ]);
+    }
+
+    public function test_a_returned_draft_cannot_be_sent_to_a_different_reviewer(): void
+    {
+        $gestor = User::create([
+            'name' => 'Gestor',
+            'email' => 'gestor@example.test',
+            'password' => 'password',
+            'rol' => 'gestion',
+        ]);
+        $revisorQueDevolvio = User::create([
+            'name' => 'Revisor que devolvió',
+            'email' => 'revisor1@example.test',
+            'password' => 'password',
+            'rol' => 'revision',
+        ]);
+        $otroRevisor = User::create([
+            'name' => 'Otro revisor',
+            'email' => 'revisor2@example.test',
+            'password' => 'password',
+            'rol' => 'revision',
+        ]);
+        $unidad = UnidadResponsable::create(['nombre' => 'Ingeniería', 'tipo' => 'Facultad']);
+        $unidadSecundaria = UnidadResponsable::create(['nombre' => 'Rectorado', 'tipo' => 'Administrativa']);
+        $tipo = TipoInstrumento::create(['nombre' => 'Convenio marco', 'categoria' => 'Colaboración']);
+        $convenio = Convenio::create([
+            'fecha_creacion' => now()->toDateString(),
+            'titulo' => 'Convenio devuelto',
+            'estado' => 'borrador',
+            'codigo' => 'CONV-OTRO-REVISOR-001',
+            'tipo_instrumento_id' => $tipo->id,
+            'unidad_responsable_id' => $unidad->id,
+            'unidad_responsable_secundaria_id' => $unidadSecundaria->id,
+        ]);
+        $convenio->historialEstados()->create([
+            'user_id' => $revisorQueDevolvio->id,
+            'fundamento' => 'Completar los datos',
+            'fecha_cambio' => now(),
+            'estado_anterior' => 'revision',
+            'estado_nuevo' => 'borrador',
+        ]);
+
+        Sanctum::actingAs($gestor);
+        $this->putJson("/api/convenios/{$convenio->id}", [
+            'estado' => 'revision',
+            'revisor_id' => $otroRevisor->id,
+            'fundamento' => 'Se corrigieron los datos',
+        ])->assertUnprocessable()
+            ->assertJsonValidationErrors(['revisor_id']);
+
+        Sanctum::actingAs($revisorQueDevolvio);
+        $this->putJson("/api/convenios/{$convenio->id}", [
+            'estado' => 'revision',
+            'revisor_id' => $revisorQueDevolvio->id,
+            'fundamento' => 'Se corrigieron los datos',
+        ])->assertForbidden();
+
+        $this->assertDatabaseHas('convenios', [
+            'id' => $convenio->id,
+            'estado' => 'borrador',
+            'revisor_id' => null,
+        ]);
     }
 }
